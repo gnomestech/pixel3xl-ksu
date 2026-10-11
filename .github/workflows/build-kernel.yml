@@ -90,13 +90,19 @@ jobs:
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
           CONFIG_KSU=y
+          CONFIG_LTO_CLANG=n
+          CONFIG_THINLTO=n
+          CONFIG_CFI_CLANG=n
+          CONFIG_LTO_NONE=y
           EOF
           make O=out CC=clang ${{ inputs.defconfig }}
           make O=out CC=clang olddefconfig
-          grep -E "CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_OVERLAY_FS=|CONFIG_KALLSYMS_ALL=" out/.config
+          grep -E "CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_OVERLAY_FS=|CONFIG_KALLSYMS_ALL=|CONFIG_LTO|CONFIG_CFI" out/.config
           # fail early if KSU was silently dropped
           grep -q "CONFIG_KSU=y" out/.config
           grep -q "CONFIG_KPROBES=y" out/.config
+          # fail early if LTO is still on (slow final link)
+          ! grep -q "CONFIG_LTO_CLANG=y" out/.config
 
       - name: Build kernel
         working-directory: kernel
