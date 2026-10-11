@@ -1,0 +1,158 @@
+name: Build Pixel 3 XL kernel (KernelSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Kernel branch (android.googlesource.com/kernel/msm)"
+        required: true
+        default: "android-msm-crosshatch-4.9-android12"
+      ksu_tag:
+        description: "KernelSU tag (v0.9.5 is the last one that supports 4.9)"
+        required: true
+        default: "v0.9.5"
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "b1c1_defconfig"
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  CLANG_DIR: ${{ github.workspace }}/toolchains/clang-r416183b
+  GCC64_DIR: ${{ github.workspace }}/toolchains/gcc64
+  GCC32_DIR: ${{ github.workspace }}/toolchains/gcc32
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev \
+            git curl lz4 python3 zip unzip device-tree-compiler cpio rsync
+
+      - name: Download toolchains
+        run: |
+          set -e
+          mkdir -p "$CLANG_DIR" "$GCC64_DIR" "$GCC32_DIR"
+          BASE=https://android.googlesource.com/platform/prebuilts
+          curl -fL "$BASE/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz" \
+            | tar -xz -C "$CLANG_DIR"
+          curl -fL "$BASE/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android12-release.tar.gz" \
+            | tar -xz -C "$GCC64_DIR"
+          curl -fL "$BASE/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/heads/android12-release.tar.gz" \
+            | tar -xz -C "$GCC32_DIR"
+          "$CLANG_DIR/bin/clang" --version | head -1
+          ls "$GCC64_DIR/bin" | head -3
+
+      - name: Dummy mkdtimg (dtbo.img is not flashed, only the kernel is)
+        run: |
+          mkdir -p "$HOME/bin"
+          printf '#!/bin/sh\nfor a in "$@"; do out="$a"; done\n[ -n "$out" ] && : > "$out"\nexit 0\n' > "$HOME/bin/mkdtimg"
+          chmod +x "$HOME/bin/mkdtimg"
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            https://android.googlesource.com/kernel/msm kernel
+          ls kernel | head
+
+      - name: Inject KernelSU
+        working-directory: kernel
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
+            | bash -s "${{ inputs.ksu_tag }}"
+          ls -l drivers/kernelsu
+          git -C KernelSU describe --tags || true
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$HOME/bin:$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLANG_DIR/lib64:$LD_LIBRARY_PATH"
+          cat >> arch/arm64/configs/${{ inputs.defconfig }} << 'EOF'
+          CONFIG_MODULES=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_KSU=y
+          EOF
+          make O=out CC=clang ${{ inputs.defconfig }}
+          make O=out CC=clang olddefconfig
+          grep -E "CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_OVERLAY_FS=|CONFIG_KALLSYMS_ALL=" out/.config
+          # fail early if KSU was silently dropped
+          grep -q "CONFIG_KSU=y" out/.config
+          grep -q "CONFIG_KPROBES=y" out/.config
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$HOME/bin:$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLANG_DIR/lib64:$LD_LIBRARY_PATH"
+          make O=out CC=clang -j"$(nproc)" \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            DTC_EXT="$(which dtc)" 2>&1 | tee ../build.log
+          ls -lh out/arch/arm64/boot/ | grep -i -E "image|dtb"
+
+      - name: Locate kernel image
+        id: img
+        working-directory: kernel
+        run: |
+          for f in Image.lz4-dtb Image.gz-dtb Image.lz4 Image.gz Image; do
+            if [ -f "out/arch/arm64/boot/$f" ]; then
+              echo "name=$f" >> "$GITHUB_OUTPUT"
+              echo "Using $f"
+              exit 0
+            fi
+          done
+          echo "No kernel image found" >&2
+          exit 1
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp "kernel/out/arch/arm64/boot/${{ steps.img.outputs.name }}" "ak3/${{ steps.img.outputs.name }}"
+          # best-effort AnyKernel3 properties for the Pixel 3 / 3 XL
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
+          sed -i 's|^block=.*|block=boot;|' ak3/anykernel.sh
+          sed -i 's|^BLOCK=.*|BLOCK=boot;|' ak3/anykernel.sh
+          sed -i 's/^is_slot_device=.*/is_slot_device=auto;/' ak3/anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/' ak3/anykernel.sh
+          cd ak3
+          zip -r9 ../crosshatch-ksu-kernel.zip . -x "*.git*"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosshatch-ksu
+          path: |
+            crosshatch-ksu-kernel.zip
+            kernel/out/arch/arm64/boot/${{ steps.img.outputs.name }}
+            build.log
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
